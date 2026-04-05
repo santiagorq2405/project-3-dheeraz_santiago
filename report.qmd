@@ -1,0 +1,461 @@
+---
+title: "Project 3: Credit Repayment Risk Assessment"
+subtitle: "MATH-516 Applied Statistics"
+author: "Shanmukha Sai Dheeraz Chavali & Santiago Rivadeneira Quintero"
+date: "2026-04-05"
+format:
+  pdf:
+    number-sections: true
+    fig-pos: "H"
+    fig-width: 6.5
+    fig-height: 4
+    fontsize: 11pt
+    geometry: margin=1in
+    keep-tex: false
+execute:
+  echo: false
+  warning: false
+  message: false
+  cache: true
+bibliography: references.bib
+---
+
+```{r setup}
+#| label: setup
+#| cache: false
+
+library(tidyverse)
+library(scales)
+library(patchwork)
+library(knitr)
+library(kableExtra)
+library(glmnet)
+library(bnlearn)
+library(boot)
+library(igraph)
+
+set.seed(516)
+
+theme_set(
+  theme_minimal(base_size = 12) +
+    theme(
+      plot.title       = element_text(size = 13, face = "bold"),
+      plot.subtitle    = element_text(size = 11, color = "grey40"),
+      axis.title       = element_text(size = 11),
+      axis.text        = element_text(size = 10),
+      legend.text      = element_text(size = 10),
+      panel.grid.minor = element_blank()
+    )
+)
+```
+
+```{r load-data}
+#| label: load-data
+
+df_raw <- read.csv("updated_datasets/low3007upd.csv")
+
+df_raw <- df_raw %>%
+  mutate(EDUCATION = ifelse(EDUCATION %in% c(4, 5, 6), 4L, as.integer(EDUCATION)))
+
+covar_names <- setdiff(names(df_raw), c("Y", "A"))
+n_obs <- nrow(df_raw)
+n_covars <- length(covar_names)
+default_rate <- mean(df_raw$Y)
+ppp_rate <- mean(df_raw$A)
+naive_p1 <- mean(df_raw$Y[df_raw$A == 1])
+naive_p0 <- mean(df_raw$Y[df_raw$A == 0])
+naive_diff <- naive_p1 - naive_p0
+```
+
+\newpage
+
+# Abstract {.unnumbered}
+
+Credit card issuers offer Payment Protection Plans (PPPs) that let customers pause repayments during hardship without incurring interest. We investigate whether enrolling in a PPP causally affects the risk of missing a credit card payment, using data on `r n_obs` customers with 22 covariates covering demographics, credit limit, and six months of payment history. Because PPP enrollment is not random, a simple comparison of default rates between enrollees and non-enrollees confounds the treatment effect with pre-existing risk factors. We estimate the Average Causal Effect (ACE) using two complementary approaches, outcome regression and inverse probability weighting, each applied with four different covariate adjustment sets: all available covariates, a LASSO-selected subset, and two sets derived from causal discovery algorithms (PC and SI-HITON-PC). The all-covariates adjustment produces the smallest ACE estimate (OR: 0.169, IPW: 0.158), while both causal discovery methods yield estimates close to the unadjusted difference (approximately 0.21). All eight estimates are positive with bootstrap 95% confidence intervals excluding zero, indicating that PPP enrollment is associated with higher default risk even after adjustment. We discuss the sensitivity of these conclusions to the choice of adjustment set and the limitations of constraint-based causal discovery with small mixed-type datasets.
+
+\newpage
+
+# Introduction
+
+Predicting whether a customer will miss their next credit card payment is important for credit card issuers, since missed payments trigger interest charges that represent a primary revenue source. Some customers enroll in Payment Protection Plans (PPPs), which allow them to pause repayments during financial hardship without penalty. A natural question is whether these plans actually reduce the risk of default, or whether the customers who choose to enroll are already at higher risk, making a naive comparison misleading.
+
+In formal terms, we define $Y$ as the binary outcome (1 if a customer misses their next payment, 0 otherwise) and $A$ as the binary treatment (1 if enrolled in a PPP, 0 otherwise). The quantity we want to estimate is the Average Causal Effect, defined as $\text{ACE} = \mathbb{E}[Y^{a=1}] - \mathbb{E}[Y^{a=0}]$, where $Y^{a=1}$ and $Y^{a=0}$ are the potential outcomes under treatment and control, respectively [@hernan2020]. A negative ACE would mean PPPs reduce default risk on average, while a positive ACE would mean they increase it.
+
+The key challenge is that PPP enrollment is not randomly assigned. Customers who anticipate financial difficulty may be more likely to enroll, creating confounding: the same factors that drive enrollment also drive default. A simple comparison $\mathbb{E}[Y \mid A=1] - \mathbb{E}[Y \mid A=0]$ does not equal the ACE unless we adjust for confounding variables $\mathbf{L}$. Under the assumptions of consistency, conditional exchangeability ($Y^a \perp\!\!\!\perp A \mid \mathbf{L}$), and positivity ($0 < P(A=1 \mid \mathbf{L}) < 1$), the causal effect is identified through the standardization formula $\mathbb{E}[Y^a] = \sum_{\mathbf{l}} \mathbb{E}[Y \mid A=a, \mathbf{L}=\mathbf{l}] P(\mathbf{L}=\mathbf{l})$ [@hernan2020, Chapters 2 and 12].
+
+Choosing the right adjustment set $\mathbf{L}$ is therefore critical. Including too few variables risks residual confounding, while including too many (particularly instruments or colliders) can introduce bias. We approach this problem from four angles: using all available covariates, applying LASSO for data-driven variable selection, and using two causal discovery algorithms to identify the Markov blanket of $Y$ and restrict adjustment to causally relevant variables [@peters2017; @pearl2009].
+
+The remainder of this report is organized as follows. Section 2 describes the dataset and preprocessing decisions. Section 3 presents exploratory evidence that key covariates confound the treatment-outcome relationship. Section 4 formally defines our two estimation strategies (outcome regression and inverse probability weighting), the four adjustment set selection methods, and the bootstrap procedure for uncertainty quantification. Section 5 reports the results, including the learned causal graphs, ACE estimates with confidence intervals, and propensity score diagnostics. Section 6 discusses the implications, limitations, and sensitivity of our conclusions to methodological choices.
+
+# Data Description
+
+The dataset consists of `r n_obs` simulated customer records based on the credit card repayment dataset described by @yeh2009, with an additional treatment variable $A$ representing PPP enrollment. Each customer has a binary outcome $Y$ (1 if they missed their next payment), a binary treatment $A$ (1 if enrolled in a PPP), and 22 covariates covering demographics (sex, education, age), financial status (credit limit), and six months of payment history (repayment status codes PAY_0, PAY_2 through PAY_6, monthly bill amounts BILL_AMT1 through BILL_AMT6, and monthly payment amounts PAY_AMT1 through PAY_AMT6).
+
+The overall default rate is `r round(100 * default_rate, 1)`% and the PPP enrollment rate is `r round(100 * ppp_rate, 1)`%. @tbl-ya presents the cross-tabulation of outcome and treatment: among PPP enrollees 89 out of 235 (37.9%) defaulted, compared to 45 out of 265 (17.0%) among non-enrollees. This gives a naive risk difference of `r round(naive_diff, 3)`, but we cannot interpret this as causal because enrollment is self-selected.
+
+```{r ya-table}
+#| label: tbl-ya
+#| tbl-cap: "Cross-tabulation of the outcome $Y$ (missed payment) and treatment $A$ (PPP enrollment). PPP enrollees have a substantially higher observed default rate (37.9\\%) than non-enrollees (17.0\\%), but this comparison is confounded."
+
+ya_tab <- table(Y = df_raw$Y, A = df_raw$A)
+ya_df <- as.data.frame.matrix(ya_tab)
+ya_df$Y <- rownames(ya_df)
+ya_df <- ya_df %>%
+  rename(`No PPP (A=0)` = `0`, `PPP (A=1)` = `1`) %>%
+  select(Y, everything())
+
+ya_df %>%
+  kable(booktabs = TRUE, align = "lrr") %>%
+  kable_styling(latex_options = "hold_position", font_size = 10)
+```
+
+There are no missing values in the dataset. The education variable originally had six levels, but levels 4, 5, and 6 contained only 5, 2, and 1 observations respectively. Including them as separate categories would create near-empty cells in the treatment-outcome cross-tabulation, leading to separation or quasi-separation in the logistic regression and producing unstable coefficient estimates with inflated standard errors. We therefore collapsed these three levels into a single "Other" category. The PAY variables take ordinal values from $-2$ (no consumption) through positive integers representing months of payment delay. We treat these as numeric predictors in all regression models, which assumes an approximately linear effect per unit increase in delay status. This is a simplification, but it keeps the models parsimonious and is supported by the monotonically increasing relationship between PAY values and observed default rates in our data.
+
+# Exploratory Data Analysis
+
+The main purpose of our exploratory analysis is to check for evidence of confounding, meaning that the covariates are associated with both treatment assignment and the outcome. If such associations exist, a naive comparison will be biased.
+
+We start by examining how PPP enrollment rates vary across levels of key covariates. @fig-edu-treat shows the treatment distribution by education level. Among customers with graduate-level education, only 37.4% enrolled in a PPP, while among those with only a high school education the rate is 79.2%. This large difference means education is a strong predictor of treatment and must be accounted for in any causal analysis. @fig-sex-treat shows a more moderate pattern by sex: females enroll at 49.7% compared to 43.3% for males.
+
+```{r fig-edu-treat}
+#| label: fig-edu-treat
+#| fig-cap: "PPP enrollment by education level. Customers with lower education levels are substantially more likely to enroll in a PPP, suggesting that education is a confounder."
+
+edu_labels <- c("1" = "Graduate", "2" = "University", "3" = "HighSchool", "4" = "Other")
+ggplot(df_raw, aes(x = factor(EDUCATION, labels = edu_labels),
+                   fill = factor(A, labels = c("No PPP", "PPP")))) +
+  geom_bar(position = "dodge", alpha = 0.8) +
+  labs(x = "Education", y = "Count", fill = "Treatment") +
+  scale_fill_manual(values = c("No PPP" = "grey60", "PPP" = "steelblue"))
+```
+
+```{r fig-sex-treat}
+#| label: fig-sex-treat
+#| fig-cap: "PPP enrollment by sex. Females enroll slightly more often than males (49.7\\% vs 43.3\\%), indicating that sex is associated with treatment assignment."
+
+ggplot(df_raw, aes(x = factor(SEX, labels = c("Female", "Male")),
+                   fill = factor(A, labels = c("No PPP", "PPP")))) +
+  geom_bar(position = "dodge", alpha = 0.8) +
+  labs(x = "Sex", y = "Count", fill = "Treatment") +
+  scale_fill_manual(values = c("No PPP" = "grey60", "PPP" = "steelblue"))
+```
+
+We also want to confirm that these same covariates are associated with the outcome. @fig-age-default displays the age distribution by default status and treatment group. Among the non-enrolled, most customers are young (peaking around age 25) and very few default. Among the enrolled, the age distribution is more spread out and defaults are visibly more common across the age range. This suggests that older customers are both more likely to enroll and more likely to default, reinforcing the need for adjustment.
+
+```{r fig-age-default}
+#| label: fig-age-default
+#| fig-cap: "Age distribution by default status (color) and PPP enrollment (panel). The No PPP group is younger and has fewer defaults. The PPP group is older and shows a higher proportion of defaults across the age range."
+
+ggplot(df_raw, aes(x = AGE, fill = factor(Y, labels = c("No default", "Default")))) +
+  geom_histogram(bins = 20, alpha = 0.7, position = "identity") +
+  facet_wrap(~ factor(A, labels = c("No PPP", "PPP"))) +
+  labs(x = "Age", y = "Count", fill = "Outcome") +
+  scale_fill_manual(values = c("No default" = "grey60", "Default" = "firebrick"))
+```
+
+To complete the confounding argument, we must verify that these covariates are associated with both treatment and outcome. The plots above show that education and sex predict PPP enrollment (@fig-edu-treat, @fig-sex-treat), while @fig-age-default shows that age and treatment status jointly predict default. We also verified that education is associated with the outcome: among customers with graduate-level education, the default rate is `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 1]), 1)`%, compared to `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 3]), 1)`% for high school graduates. Similarly, older customers have higher PPP enrollment rates (mean age of enrollees: `r round(mean(df_raw$AGE[df_raw$A == 1]), 1)` years vs `r round(mean(df_raw$AGE[df_raw$A == 0]), 1)` years for non-enrollees). These two-way associations confirm that education and age are confounders of the treatment-outcome relationship.
+
+Together, these findings establish that the naive risk difference of `r round(naive_diff, 3)` is likely inflated by confounding. The central question is how much of the observed association survives once we properly adjust for these and other covariates.
+
+# Statistical Methods
+
+## The Causal Estimand
+
+We define the ACE as the difference in potential outcomes averaged over the population:
+
+$$
+\text{ACE} = \mathbb{E}[Y^{a=1}] - \mathbb{E}[Y^{a=0}].
+$$
+
+Under three identifying assumptions, each potential outcome mean is identified from observed data [@hernan2020]. First, **consistency** requires that the observed outcome equals the potential outcome under the received treatment: $Y_i = Y_i^a$ whenever $A_i = a$. Second, **conditional exchangeability** requires that treatment assignment is independent of the potential outcomes given the adjustment set: $Y^a \perp\!\!\!\perp A \mid \mathbf{L}$, meaning there are no unmeasured confounders beyond $\mathbf{L}$. Third, **positivity** requires that every covariate pattern has a non-zero probability of receiving each treatment level: $0 < P(A=1 \mid \mathbf{L}) < 1$. We use two estimation strategies, both based on logistic regression, and apply each one with four different choices of $\mathbf{L}$.
+
+## Outcome Regression (Standardization)
+
+The first approach models the outcome directly. We fit a logistic regression $P(Y=1 \mid A, \mathbf{L}) = \text{logit}^{-1}(\theta_0 + \theta_A A + \boldsymbol{\theta}_L^\top \mathbf{L})$, where $\text{logit}^{-1}(x) = e^x/(1+e^x)$ is the inverse logit function, and estimate each potential outcome mean by standardization over the empirical covariate distribution:
+
+$$
+\hat{\mathbb{E}}[Y^a] = \frac{1}{n} \sum_{i=1}^{n} \hat{P}(Y=1 \mid A=a, \mathbf{L}_i).
+$$
+
+This is sometimes called the G-computation estimator. It requires a correctly specified outcome model but does not depend on the propensity score [@hernan2020, Chapter 13].
+
+## Inverse Probability Weighting (IPW)
+
+The second approach models the treatment assignment [@rosenbaum1983]. We fit a logistic regression for the propensity score $P(A=1 \mid \mathbf{L}) = \text{logit}^{-1}(\beta_0 + \boldsymbol{\beta}_L^\top \mathbf{L})$ and estimate each potential outcome mean using the Hajek (stabilized) estimator:
+
+$$
+\hat{\mathbb{E}}[Y^a] = \frac{\sum_{i=1}^{n} Y_i \cdot \mathbf{1}(A_i = a) / \hat{P}(A_i = a \mid \mathbf{L}_i)}{\sum_{i=1}^{n} \mathbf{1}(A_i = a) / \hat{P}(A_i = a \mid \mathbf{L}_i)}.
+$$
+
+We chose the Hajek form over the Horvitz-Thompson estimator because it is less sensitive to extreme weights and normalizes to a proper weighted average [@hernan2020, Chapter 12]. To guard against near-violations of positivity, we trim estimated propensity scores to the range $[0.01, 0.99]$ before computing the weights, following standard practice in the causal inference literature to prevent any single observation from receiving a weight exceeding 100 [@hernan2020].
+
+Asymptotically, both OR and IPW should give the same ACE if their respective models are correctly specified. In finite samples, they may differ because of model misspecification or variance in the weights, and comparing them serves as a useful robustness check [@hernan2020].
+
+## Adjustment Set Selection
+
+The choice of adjustment set $\mathbf{L}$ determines whether the identifying assumptions hold. Since the true causal structure is unknown, we adopt a multi-strategy approach to assess the sensitivity of our conclusions to this choice. We progress from the most inclusive strategy (all covariates) to increasingly selective data-driven methods, allowing us to examine how the ACE estimate changes as we remove potentially irrelevant variables and to identify which covariates are most important for confounding adjustment. We consider four strategies, ordered from most inclusive to most selective.
+
+**Set 1: All covariates.** We include all 22 available covariates. This is the most conservative approach: if the true confounders are a subset of these variables, adjustment for all of them still yields a valid estimate, provided we do not inadvertently condition on a collider or an instrument. Given the data-generating context (all covariates are pre-treatment baseline characteristics), this is unlikely.
+
+**Set 2: LASSO selection.** With 22 covariates and only 500 observations, the full model may overfit. We use the LASSO [@tibshirani1996] to select a sparser set of covariates that are predictive of the outcome $Y$. We fit a penalized logistic regression $Y \sim \mathbf{L}$ (without $A$) using 10-fold cross-validation and select covariates with non-zero coefficients at the $\lambda_{\text{1se}}$ threshold, which favors parsimony. The selected covariates are then used in both the outcome and propensity score models, with $A$ always included in the outcome model regardless of selection. In the context of causal inference, a sparser adjustment set also reduces the risk of inadvertently conditioning on instruments or colliders that could introduce bias, making the parsimonious $\lambda_{\text{1se}}$ threshold preferable to the less restrictive $\lambda_{\min}$. We use the `glmnet` package [@friedman2010] for this step.
+
+**Set 3: PC algorithm.** The PC algorithm [@kalisch2007; @spirtes2000] learns a Completed Partially Directed Acyclic Graph (CPDAG), which represents the equivalence class of all Directed Acyclic Graphs (DAGs) that encode the same set of conditional independence relations. The algorithm operates under the assumptions of causal sufficiency (no hidden common causes), the Markov condition (every variable is conditionally independent of its non-descendants given its parents), and faithfulness (all observed independences are entailed by the graph structure). From the learned CPDAG, we extract the Markov blanket of $Y$, defined as the minimal set of variables that renders $Y$ conditionally independent of all remaining variables; in a DAG, this consists of the parents, children, and co-parents of children of $Y$. We define the adjustment set as $\mathbf{L}_{\text{PC}} = \text{MB}(Y) \setminus \{A\}$. We use the implementation `pc.stable()` from the `bnlearn` package [@scutari2010] with Pearson's partial correlation test (`test = "cor"`) at significance level $\alpha = 0.05$. We chose the partial correlation test over the mixed conditional Gaussian test (`mi-cg`) because the latter lacked statistical power with our sample size and returned $Y$ as completely isolated in the graph at all tested significance levels up to $\alpha = 0.20$. We acknowledge that using Pearson partial correlations on mixed continuous-discrete data after numeric encoding is an approximation; rank-based or dedicated mixed-type tests would be more principled, but the available alternatives in `bnlearn` either lacked power or produced degenerate results with our sample size of 500.
+
+**Set 4: SI-HITON-PC.** The Semi-Interleaved HITON-PC algorithm [@aliferis2003] is a local causal discovery method designed specifically to find the Markov blanket of a target variable without learning the full graph. It achieves this through iterative forward selection and backward pruning using conditional independence tests. We again use `bnlearn`'s `si.hiton.pc()` with the same partial correlation test and $\alpha = 0.05$, and define $\mathbf{L}_{\text{Local}} = \text{MB}(Y) \setminus \{A\}$.
+
+## Uncertainty Quantification
+
+We construct 95% confidence intervals for each ACE estimate using the nonparametric bootstrap with 1000 resamples [@efron1994]. We chose 1000 resamples because this provides sufficient precision for the percentile endpoints at the 95% level, with a Monte Carlo error of approximately 0.7% at each tail. In each bootstrap iteration, we re-estimate the full pipeline (fit the outcome or propensity model, compute the standardized or IPW estimate) on the resampled data. We report percentile-based confidence intervals rather than bias-corrected accelerated (BCa) intervals because the latter require second-order corrections that can be unreliable with complex estimation pipelines and moderate sample sizes. Propensity scores are trimmed to $[0.01, 0.99]$ within each bootstrap sample to prevent weight explosion. All random procedures (LASSO cross-validation, causal discovery, bootstrap resampling) used a fixed random seed for reproducibility.
+
+## Computational Environment
+
+All analyses were performed in R (version `r R.version.string`) using the following packages: `glmnet` version `r packageVersion("glmnet")` [@friedman2010] for LASSO regularization, `bnlearn` version `r packageVersion("bnlearn")` [@scutari2010] for causal discovery, `boot` version `r packageVersion("boot")` [@efron1994] for bootstrapping, and `igraph` version `r packageVersion("igraph")` for graph visualization. Data manipulation and plotting relied on the `tidyverse` suite version `r packageVersion("tidyverse")` and `patchwork` version `r packageVersion("patchwork")`.
+
+# Results
+
+## Adjustment Sets
+
+```{r adjustment-sets}
+#| label: adjustment-sets
+
+X_lasso <- model.matrix(~ . - 1, data = df_raw[, covar_names])
+y_lasso <- df_raw$Y
+
+set.seed(516)
+cv_fit <- cv.glmnet(X_lasso, y_lasso, family = "binomial",
+                     alpha = 1, nfolds = 10)
+
+lasso_coefs <- coef(cv_fit, s = "lambda.1se")
+lasso_vars <- rownames(lasso_coefs)[which(lasso_coefs != 0)]
+lasso_vars <- setdiff(lasso_vars, "(Intercept)")
+
+df_bn_num <- as.data.frame(lapply(df_raw, as.numeric))
+
+set.seed(516)
+pc_fit <- pc.stable(df_bn_num, test = "cor", alpha = 0.05)
+mb_Y_pc <- mb(pc_fit, "Y")
+L_pc <- setdiff(mb_Y_pc, c("Y", "A"))
+
+set.seed(516)
+local_fit <- si.hiton.pc(df_bn_num, test = "cor", alpha = 0.05)
+mb_Y_local <- mb(local_fit, "Y")
+L_local <- setdiff(mb_Y_local, c("Y", "A"))
+```
+
+```{r tbl-adj-sets}
+#| label: tbl-adj-sets
+#| tbl-cap: "The four adjustment sets and their selected covariates. The all-covariates set includes all 22 variables. LASSO selects three: AGE, PAY\\_0, and PAY\\_2. Both causal discovery methods identify only PAY\\_0 as the adjustment variable."
+
+adj_df <- tibble(
+  Set = c("All covariates", "LASSO", "PC algorithm", "SI-HITON-PC"),
+  Size = c(length(covar_names), length(lasso_vars), length(L_pc), length(L_local)),
+  Variables = c(
+    "All 22 covariates",
+    paste(lasso_vars, collapse = ", "),
+    ifelse(length(L_pc) > 0, paste(L_pc, collapse = ", "), "Empty"),
+    ifelse(length(L_local) > 0, paste(L_local, collapse = ", "), "Empty")
+  )
+)
+
+adj_df %>%
+  kable(booktabs = TRUE, align = "lrl") %>%
+  kable_styling(latex_options = "hold_position", font_size = 10)
+```
+
+@tbl-adj-sets summarizes the four adjustment sets. The LASSO at the parsimonious $\lambda_{\text{1se}}$ threshold selects three covariates: AGE, PAY_0 (the most recent repayment status), and PAY_2 (the repayment status two months prior). This aligns with the EDA, which showed that age and payment history are the strongest predictors of both treatment and outcome. At the less restrictive $\lambda_{\min}$, 11 covariates are selected, but we use the sparser set to reduce overfitting risk.
+
+Both the PC algorithm and SI-HITON-PC identify the same Markov blanket for $Y$: $\{A, \text{PAY\_0}\}$. Since $A$ is the treatment, the adjustment set from both methods is $\mathbf{L} = \{\text{PAY\_0}\}$. The agreement between these two independent methods is reassuring, though the resulting set is very small. We return to the implications of this in the discussion.
+
+## Learned Causal Graphs
+
+The PC algorithm learns a CPDAG with 14 arcs across the 24 variables. @fig-pc-graph shows the structure around $Y$. Both $A$ and PAY_0 are identified as parents of $Y$, with directed edges pointing into $Y$. The treatment variable $A$ is itself connected to EDUCATION, AGE, and SEX, which represent confounders of the $A$-$Y$ relationship. However, these variables do not appear in the Markov blanket of $Y$ because the algorithm finds no direct edge between them and $Y$. The payment history variables form a chain (PAY_0 -- PAY_2 -- PAY_3 -- PAY_4 -- PAY_5 -- PAY_6), reflecting the natural serial dependence in monthly repayment behavior.
+
+```{r fig-pc-graph}
+#| label: fig-pc-graph
+#| fig-cap: "CPDAG learned by the PC-stable algorithm. Red: outcome $Y$. Blue: treatment $A$. Gold: Markov blanket of $Y$ (PAY\\_0). Grey: remaining variables. Both $A$ and PAY\\_0 are parents of $Y$. The treatment $A$ is connected to EDUCATION, AGE, and SEX, which predict enrollment but are not in the Markov blanket of $Y$."
+#| fig-width: 7
+#| fig-height: 5.5
+
+bn_igraph <- as.igraph(pc_fit)
+set.seed(516)
+plot(bn_igraph,
+     vertex.size = 18,
+     vertex.label.cex = 0.7,
+     vertex.color = ifelse(V(bn_igraph)$name == "Y", "firebrick",
+                    ifelse(V(bn_igraph)$name == "A", "steelblue",
+                    ifelse(V(bn_igraph)$name %in% mb_Y_pc, "gold", "grey80"))),
+     vertex.label.color = "black",
+     edge.arrow.size = 0.4)
+legend("bottomright",
+       legend = c("Outcome (Y)", "Treatment (A)", "MB(Y)", "Other"),
+       fill = c("firebrick", "steelblue", "gold", "grey80"),
+       cex = 0.7)
+```
+
+## ACE Estimates
+
+```{r all-estimation}
+#| label: all-estimation
+
+PS_TRIM_LO <- 0.01
+PS_TRIM_HI <- 0.99
+
+estimate_ace <- function(data, covar_set) {
+  or_frm <- as.formula(paste("Y ~ A +", paste(covar_set, collapse = " + ")))
+  fit_or <- glm(or_frm, data = data, family = binomial)
+  d1 <- data; d1$A <- 1
+  d0 <- data; d0$A <- 0
+  ey1_or <- mean(predict(fit_or, newdata = d1, type = "response"))
+  ey0_or <- mean(predict(fit_or, newdata = d0, type = "response"))
+
+  ps_frm <- as.formula(paste("A ~", paste(covar_set, collapse = " + ")))
+  fit_ps <- glm(ps_frm, data = data, family = binomial)
+  ps <- pmin(pmax(predict(fit_ps, type = "response"), PS_TRIM_LO), PS_TRIM_HI)
+  w1 <- data$A / ps
+  w0 <- (1 - data$A) / (1 - ps)
+  ey1_ipw <- sum(w1 * data$Y) / sum(w1)
+  ey0_ipw <- sum(w0 * data$Y) / sum(w0)
+
+  list(or = ey1_or - ey0_or, ipw = ey1_ipw - ey0_ipw,
+       ps = predict(fit_ps, type = "response"))
+}
+
+res_all   <- estimate_ace(df_raw, covar_names)
+res_lasso <- estimate_ace(df_raw, lasso_vars)
+res_pc    <- estimate_ace(df_raw, L_pc)
+res_local <- estimate_ace(df_raw, L_local)
+```
+
+```{r bootstrap}
+#| label: bootstrap
+
+boot_ace <- function(data, indices, covar_set, method) {
+  d <- data[indices, ]
+  if (method == "OR") {
+    frm <- as.formula(paste("Y ~ A +", paste(covar_set, collapse = " + ")))
+    fit <- tryCatch(glm(frm, data = d, family = binomial), error = function(e) NULL)
+    if (is.null(fit)) return(NA)
+    d1 <- d; d1$A <- 1; d0 <- d; d0$A <- 0
+    return(mean(predict(fit, newdata = d1, type = "response")) -
+           mean(predict(fit, newdata = d0, type = "response")))
+  }
+  if (method == "IPW") {
+    frm_ps <- as.formula(paste("A ~", paste(covar_set, collapse = " + ")))
+    fit_ps <- tryCatch(glm(frm_ps, data = d, family = binomial), error = function(e) NULL)
+    if (is.null(fit_ps)) return(NA)
+    ps <- pmin(pmax(predict(fit_ps, type = "response"), 0.01), 0.99)
+    w1 <- d$A / ps; w0 <- (1 - d$A) / (1 - ps)
+    return(sum(w1 * d$Y) / sum(w1) - sum(w0 * d$Y) / sum(w0))
+  }
+}
+
+N_BOOT <- 1000
+
+run_boot <- function(data, covars, method) {
+  set.seed(516)
+  b <- boot(data, statistic = boot_ace, R = N_BOOT,
+            covar_set = covars, method = method)
+  ci <- boot.ci(b, type = "perc", conf = 0.95)
+  tibble(ACE = round(b$t0, 4), SE = round(sd(b$t, na.rm = TRUE), 4),
+         CI_lo = round(ci$percent[4], 4), CI_hi = round(ci$percent[5], 4))
+}
+
+sets <- list(All = covar_names, LASSO = lasso_vars, PC = L_pc, Local = L_local)
+results <- list()
+for (adj in names(sets)) {
+  for (meth in c("OR", "IPW")) {
+    results[[paste(adj, meth, sep = "_")]] <- run_boot(df_raw, sets[[adj]], meth) %>%
+      mutate(Adjustment = adj, Method = meth, .before = 1)
+  }
+}
+ace_table <- bind_rows(results)
+```
+
+```{r tbl-ace}
+#| label: tbl-ace
+#| tbl-cap: "ACE estimates (risk difference scale) with bootstrap 95\\% confidence intervals. All estimates are positive and exclude zero, indicating that PPP enrollment is associated with higher default risk after adjustment. The all-covariates set produces the smallest estimates, while the causal discovery sets produce estimates close to the naive difference."
+
+ace_table %>%
+  mutate(CI = paste0("[", CI_lo, ", ", CI_hi, "]")) %>%
+  select(Adjustment, Method, ACE, SE, CI) %>%
+  kable(booktabs = TRUE, align = "llrrr",
+        col.names = c("Adjustment", "Method", "ACE", "SE", "95% CI")) %>%
+  kable_styling(latex_options = "hold_position", font_size = 10)
+```
+
+@tbl-ace presents the main results. All eight ACE estimates are positive and their confidence intervals exclude zero, indicating a statistically significant positive association between PPP enrollment and default risk after adjustment.
+
+The estimates show a clear pattern related to the size of the adjustment set. The all-covariates approach produces the smallest ACE values (OR: 0.169, IPW: 0.158), suggesting that adjusting for all 22 variables removes the most confounding bias. The LASSO-selected set of three variables (AGE, PAY_0, PAY_2) gives slightly larger estimates (OR: 0.179, IPW: 0.190), and the causal discovery sets, both containing only PAY_0, produce estimates (OR: 0.208, IPW: 0.211) that are virtually identical to the naive risk difference of `r round(naive_diff, 3)`.
+
+Within each adjustment set, the OR and IPW estimates agree reasonably well. The largest discrepancy is for the all-covariates set, where OR (0.169) and IPW (0.158) differ by about 0.01. This difference reflects the finite-sample instability of IPW when propensity scores are extreme. For the causal discovery sets, OR and IPW are nearly identical because the propensity score model based on PAY_0 alone produces almost constant predicted probabilities (range: 0.459 to 0.477), meaning the weights do essentially nothing.
+
+@fig-ace-compare visualizes these results. The downward trend from right (PC/Local) to left (All) is consistent: as we include more covariates, the estimated ACE decreases. The confidence intervals overlap substantially across all methods, so the differences are not statistically significant, but the pattern suggests that the full adjustment set captures confounders that the sparser sets miss.
+
+```{r fig-ace-compare}
+#| label: fig-ace-compare
+#| fig-cap: "ACE estimates with 95\\% bootstrap confidence intervals. The dotted red line marks the naive risk difference. The dashed grey line marks zero. Estimates from the all-covariates set are furthest below the naive line, indicating more confounding adjustment."
+#| fig-height: 4.5
+
+ggplot(ace_table, aes(x = Adjustment, y = ACE, color = Method)) +
+  geom_point(size = 3, position = position_dodge(width = 0.3)) +
+  geom_errorbar(aes(ymin = CI_lo, ymax = CI_hi),
+                width = 0.15, position = position_dodge(width = 0.3)) +
+  geom_hline(yintercept = 0, linetype = "dashed", color = "grey50") +
+  geom_hline(yintercept = naive_diff, linetype = "dotted", color = "firebrick",
+             linewidth = 0.7) +
+  annotate("text", x = 0.6, y = naive_diff + 0.008,
+           label = "Naive", color = "firebrick", size = 3.5, hjust = 0) +
+  labs(x = "Adjustment Set", y = "ACE (risk difference)", color = "Estimator") +
+  scale_color_manual(values = c("OR" = "steelblue", "IPW" = "darkorange"))
+```
+
+## Propensity Score Diagnostics
+
+A key diagnostic for the IPW estimator is the overlap of propensity score distributions between treated and control groups. Good overlap means that for every covariate pattern, there are both treated and untreated individuals, satisfying the positivity assumption.
+
+@fig-ps-compare shows propensity score distributions for all four adjustment sets. The all-covariates model produces propensity scores spread across the full $[0, 1]$ range, with the treated group concentrated at higher values and the control group at lower values. There is reasonable but imperfect overlap in the middle range (0.25 to 0.60); 3 out of 500 observations (0.6%) had propensity scores exceeding 0.99 and were trimmed, indicating that positivity is nearly but not perfectly satisfied. The LASSO model has a somewhat narrower range (0.12 to 0.99), reflecting the reduced model complexity, and no observations required trimming. In contrast, both the PC and Local models produce propensity scores in an extremely narrow band around 0.47 (range: 0.459 to 0.477), since PAY_0 alone barely predicts treatment assignment. While this means the positivity assumption is trivially satisfied, it also means IPW provides essentially no adjustment and the resulting ACE estimate is close to the unadjusted difference.
+
+```{r fig-ps-compare}
+#| label: fig-ps-compare
+#| fig-cap: "Propensity score distributions by treatment group for each adjustment set. The all-covariates and LASSO models produce spread-out scores with reasonable overlap. The PC and Local models produce near-constant scores, meaning IPW provides no meaningful adjustment."
+#| fig-height: 5
+
+ps_compare <- bind_rows(
+  tibble(ps = res_all$ps, A = factor(df_raw$A), Set = "All"),
+  tibble(ps = res_lasso$ps, A = factor(df_raw$A), Set = "LASSO"),
+  tibble(ps = res_pc$ps, A = factor(df_raw$A), Set = "PC"),
+  tibble(ps = res_local$ps, A = factor(df_raw$A), Set = "Local")
+)
+
+ggplot(ps_compare, aes(x = ps, fill = A)) +
+  geom_histogram(bins = 30, alpha = 0.6, position = "identity") +
+  facet_wrap(~ Set, scales = "free_y") +
+  labs(x = "Propensity Score P(A=1|L)", y = "Count", fill = "Treatment") +
+  scale_fill_manual(values = c("0" = "grey60", "1" = "steelblue"),
+                    labels = c("0" = "No PPP", "1" = "PPP"))
+```
+
+# Discussion
+
+Our analysis produces a consistent finding across all methods and adjustment sets: PPP enrollment is positively associated with credit default risk, with estimated ACEs ranging from 0.158 to 0.211. Every confidence interval excludes zero, so this conclusion is robust to the methodological choices we made. The positive direction of this association is not unexpected: PPPs are typically marketed to or sought by customers who anticipate financial difficulty, creating adverse selection whereby those most likely to default are also most likely to enroll. Even after adjusting for observed confounders, residual adverse selection may persist if unobserved risk factors (such as income stability or financial literacy) drive both enrollment and default. However, the magnitude of the effect depends substantially on which covariates we adjust for, and this dependence reveals important methodological lessons.
+
+The most interesting result is the contrast between the all-covariates adjustment and the causal discovery adjustments. The all-covariates approach removes the most confounding bias (ACE around 0.16), while both PC and SI-HITON-PC suggest that only PAY_0 needs to be in the adjustment set (ACE around 0.21, close to the naive estimate). This gap arises because the causal discovery algorithms, with only 500 observations, lack the power to detect all edges in the true causal graph. In particular, the PC graph shows that EDUCATION, AGE, and SEX are connected to the treatment $A$ but not directly to the outcome $Y$. If these variables truly have no direct effect on $Y$, then conditioning on PAY_0 alone would be sufficient. But if they do affect $Y$ through pathways the algorithm failed to detect, then the discovery-based adjustment is incomplete and the ACE is biased upward.
+
+The LASSO offers a useful middle ground. By selecting AGE, PAY_0, and PAY_2, it captures variables that are both predictive of the outcome and related to treatment assignment. The resulting ACE (0.179 for OR, 0.190 for IPW) sits between the full-adjustment and discovery-based estimates, and the standard errors are comparable to those from the all-covariates model. This suggests that a small number of well-chosen covariates can do nearly as much work as the full set, while reducing the risk of overfitting in small samples.
+
+An important limitation of our analysis is that all conclusions depend on the assumption of no unmeasured confounding. If there are factors that influence both PPP enrollment and default risk that are not captured by the 22 available covariates, then even the all-covariates adjustment is insufficient and our ACE estimates remain biased. We also note that the causal discovery results should not be interpreted as evidence for the true causal structure; they represent one member of a Markov equivalence class, and the faithfulness assumption may not hold in finite samples [@peters2017]. A larger dataset or one with richer covariates might yield different discovery results and, consequently, different adjustment sets.
+
+Finally, the positive ACE does not necessarily mean that PPPs cause default. It could reflect unmeasured confounding from factors like income stability or financial literacy that are associated with both enrollment and default but are not available in our data. This is a fundamental limitation of observational studies, and our results should be interpreted as evidence of association after adjustment rather than definitive proof of causation.
+
+# Conclusion {.unnumbered}
+
+We estimated the causal effect of PPP enrollment on credit card default using outcome regression and inverse probability weighting, each combined with four covariate adjustment strategies ranging from all 22 covariates to a single variable identified by causal discovery. All eight estimates consistently indicate a positive association between PPP enrollment and default risk (ACE between 0.158 and 0.211), with all 95% confidence intervals excluding zero. The analysis highlights a practical tension in causal inference: data-driven adjustment set selection methods (PC, SI-HITON-PC) may lack statistical power with small samples, leading to insufficient confounding control, while the all-covariates approach is more conservative but risks overfitting. The LASSO provides a principled middle ground by selecting a parsimonious yet effective set of confounders. These results underscore the importance of sensitivity analysis across multiple adjustment strategies rather than relying on a single approach.
+
+# AI Disclosure {.unnumbered}
+
+Generative AI tools (Claude, Anthropic) were used during the preparation of this report for code debugging, manuscript drafting assistance, and iterative improvement of the analysis pipeline. All AI-generated content was critically reviewed, verified, and substantially edited by the authors. The statistical methodology, interpretation of results, and all scientific conclusions are the sole responsibility of the authors. The final report reflects our own understanding and analytical judgment.
+
+# References {.unnumbered}
+
+::: {#refs}
+:::

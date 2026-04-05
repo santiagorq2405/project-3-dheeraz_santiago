@@ -1,0 +1,6 @@
+.DS_Store
+.Rhistory
+.Rproj.user/
+report_cache/
+report_files/
+*.png
