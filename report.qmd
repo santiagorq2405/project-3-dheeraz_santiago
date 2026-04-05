@@ -115,29 +115,28 @@ There are no missing values in the dataset. The education variable originally ha
 
 The main purpose of our exploratory analysis is to check for evidence of confounding, meaning that the covariates are associated with both treatment assignment and the outcome. If such associations exist, a naive comparison will be biased.
 
-We start by examining how PPP enrollment rates vary across levels of key covariates. @fig-edu-treat shows the treatment distribution by education level. Among customers with graduate-level education, only 37.4% enrolled in a PPP, while among those with only a high school education the rate is 79.2%. This large difference means education is a strong predictor of treatment and must be accounted for in any causal analysis. @fig-sex-treat shows a more moderate pattern by sex: females enroll at 49.7% compared to 43.3% for males.
+We start by examining how PPP enrollment rates vary across levels of key covariates. @fig-enroll (left) shows the treatment distribution by education level. Among customers with graduate-level education, only 37.4% enrolled in a PPP, while among those with only a high school education the rate is 79.2%. This large difference means education is a strong predictor of treatment and must be accounted for in any causal analysis. @fig-enroll (right) shows a more moderate pattern by sex: females enroll at 49.7% compared to 43.3% for males.
 
-```{r fig-edu-treat}
-#| label: fig-edu-treat
-#| fig-cap: "PPP enrollment by education level. Customers with lower education levels are substantially more likely to enroll in a PPP, suggesting that education is a confounder."
+```{r fig-enroll}
+#| label: fig-enroll
+#| fig-cap: "PPP enrollment by education level (left) and sex (right). Customers with lower education levels are substantially more likely to enroll in a PPP. Females enroll slightly more often than males (49.7\\% vs 43.3\\%)."
+#| fig-width: 6.5
+#| fig-height: 3.2
 
 edu_labels <- c("1" = "Graduate", "2" = "University", "3" = "HighSchool", "4" = "Other")
-ggplot(df_raw, aes(x = factor(EDUCATION, labels = edu_labels),
+p_edu <- ggplot(df_raw, aes(x = factor(EDUCATION, labels = edu_labels),
                    fill = factor(A, labels = c("No PPP", "PPP")))) +
   geom_bar(position = "dodge", alpha = 0.8) +
   labs(x = "Education", y = "Count", fill = "Treatment") +
   scale_fill_manual(values = c("No PPP" = "grey60", "PPP" = "steelblue"))
-```
 
-```{r fig-sex-treat}
-#| label: fig-sex-treat
-#| fig-cap: "PPP enrollment by sex. Females enroll slightly more often than males (49.7\\% vs 43.3\\%), indicating that sex is associated with treatment assignment."
-
-ggplot(df_raw, aes(x = factor(SEX, labels = c("Female", "Male")),
+p_sex <- ggplot(df_raw, aes(x = factor(SEX, labels = c("Female", "Male")),
                    fill = factor(A, labels = c("No PPP", "PPP")))) +
   geom_bar(position = "dodge", alpha = 0.8) +
   labs(x = "Sex", y = "Count", fill = "Treatment") +
   scale_fill_manual(values = c("No PPP" = "grey60", "PPP" = "steelblue"))
+
+p_edu + p_sex + plot_layout(guides = "collect") & theme(legend.position = "bottom")
 ```
 
 We also want to confirm that these same covariates are associated with the outcome. @fig-age-default displays the age distribution by default status and treatment group. Among the non-enrolled, most customers are young (peaking around age 25) and very few default. Among the enrolled, the age distribution is more spread out and defaults are visibly more common across the age range. This suggests that older customers are both more likely to enroll and more likely to default, reinforcing the need for adjustment.
@@ -153,7 +152,7 @@ ggplot(df_raw, aes(x = AGE, fill = factor(Y, labels = c("No default", "Default")
   scale_fill_manual(values = c("No default" = "grey60", "Default" = "firebrick"))
 ```
 
-To complete the confounding argument, we must verify that these covariates are associated with both treatment and outcome. The plots above show that education and sex predict PPP enrollment (@fig-edu-treat, @fig-sex-treat), while @fig-age-default shows that age and treatment status jointly predict default. We also verified that education is associated with the outcome: among customers with graduate-level education, the default rate is `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 1]), 1)`%, compared to `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 3]), 1)`% for high school graduates. Similarly, older customers have higher PPP enrollment rates (mean age of enrollees: `r round(mean(df_raw$AGE[df_raw$A == 1]), 1)` years vs `r round(mean(df_raw$AGE[df_raw$A == 0]), 1)` years for non-enrollees). These two-way associations confirm that education and age are confounders of the treatment-outcome relationship.
+To complete the confounding argument, we must verify that these covariates are associated with both treatment and outcome. The plots above show that education and sex predict PPP enrollment (@fig-enroll), while @fig-age-default shows that age and treatment status jointly predict default. We also verified that education is associated with the outcome: among customers with graduate-level education, the default rate is `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 1]), 1)`%, compared to `r round(100 * mean(df_raw$Y[df_raw$EDUCATION == 3]), 1)`% for high school graduates. Similarly, older customers have higher PPP enrollment rates (mean age of enrollees: `r round(mean(df_raw$AGE[df_raw$A == 1]), 1)` years vs `r round(mean(df_raw$AGE[df_raw$A == 0]), 1)` years for non-enrollees). These two-way associations confirm that education and age are confounders of the treatment-outcome relationship.
 
 Together, these findings establish that the naive risk difference of `r round(naive_diff, 3)` is likely inflated by confounding. The central question is how much of the observed association survives once we properly adjust for these and other covariates.
 
@@ -279,8 +278,8 @@ The PC algorithm learns a CPDAG with 14 arcs across the 24 variables. @fig-pc-gr
 ```{r fig-pc-graph}
 #| label: fig-pc-graph
 #| fig-cap: "CPDAG learned by the PC-stable algorithm. Red: outcome $Y$. Blue: treatment $A$. Gold: Markov blanket of $Y$ (PAY\\_0). Grey: remaining variables. Both $A$ and PAY\\_0 are parents of $Y$. The treatment $A$ is connected to EDUCATION, AGE, and SEX, which predict enrollment but are not in the Markov blanket of $Y$."
-#| fig-width: 7
-#| fig-height: 5.5
+#| fig-width: 6.5
+#| fig-height: 4.5
 
 bn_igraph <- as.igraph(pc_fit)
 set.seed(516)
