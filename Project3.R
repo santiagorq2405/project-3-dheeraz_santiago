@@ -303,24 +303,8 @@ if (length(lasso_vars) > 0) {
 
 cat("\nAdjustment Set 3: PC Algorithm\n")
 
-# Prepare data for bnlearn: factors for discrete, numeric for continuous
-df_bn <- df_raw
-df_bn$Y         <- factor(df_bn$Y)
-df_bn$A         <- factor(df_bn$A)
-df_bn$SEX       <- factor(df_bn$SEX)
-df_bn$EDUCATION <- factor(df_bn$EDUCATION)
-
-for (v in grep("^PAY_", names(df_bn), value = TRUE)) {
-  df_bn[[v]] <- factor(df_bn[[v]])
-}
-
-# Convert remaining integer columns to numeric for bnlearn
-for (v in names(df_bn)) {
-  if (is.integer(df_bn[[v]])) {
-    df_bn[[v]] <- as.numeric(df_bn[[v]])
-  }
-}
-
+# Convert all columns to numeric for bnlearn with Pearson correlation test
+df_bn_num <- as.data.frame(lapply(df_raw, as.numeric))
 
 set.seed(516)
 pc_fit <- pc.stable(df_bn_num, test = "cor", alpha = 0.05)
